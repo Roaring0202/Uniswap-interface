@@ -13,10 +13,12 @@ import { Position } from './entities/position'
 import { ONE, ZERO } from './internalConstants'
 import { MethodParameters, toHex } from './utils/calldata'
 import { Interface } from '@ethersproject/abi'
-import { abi } from '@uniswap/v3-periphery/artifacts/contracts/NonfungiblePositionManager.sol/NonfungiblePositionManager.json'
+import INonfungiblePositionManager from '@uniswap/v3-periphery/artifacts/contracts/NonfungiblePositionManager.sol/NonfungiblePositionManager.json'
 import { PermitOptions, SelfPermit } from './selfPermit'
 import { ADDRESS_ZERO } from './constants'
 import { Pool } from './entities'
+import { Multicall } from './multicall'
+import { Payments } from './payments'
 
 const MaxUint128 = toHex(JSBI.subtract(JSBI.exponentiate(JSBI.BigInt(2), JSBI.BigInt(128)), JSBI.BigInt(1)))
 
@@ -73,6 +75,27 @@ export type MintOptions = CommonAddLiquidityOptions & MintSpecificOptions
 export type IncreaseOptions = CommonAddLiquidityOptions & IncreaseSpecificOptions
 
 export type AddLiquidityOptions = MintOptions | IncreaseOptions
+
+export interface SafeTransferOptions {
+  /**
+   * The account sending the NFT.
+   */
+  sender: string
+
+  /**
+   * The account that should receive the NFT.
+   */
+  recipient: string
+
+  /**
+   * The id of the token being sent.
+   */
+  tokenId: BigintIsh
+  /**
+   * The optional parameter that passes data to the `onERC721Received` call for the staker
+   */
+  data?: string
+}
 
 // type guard
 function isMint(options: AddLiquidityOptions): options is MintOptions {
@@ -149,15 +172,13 @@ export interface RemoveLiquidityOptions {
   collectOptions: Omit<CollectOptions, 'tokenId'>
 }
 
-export abstract class NonfungiblePositionManager extends SelfPermit {
-  public static INTERFACE: Interface = new Interface(abi)
+export abstract class NonfungiblePositionManager {
+  public static INTERFACE: Interface = new Interface(INonfungiblePositionManager.abi)
 
   /**
    * Cannot be constructed.
    */
-  private constructor() {
-    super()
-  }
+  private constructor() {}
 
   private static encodeCreate(pool: Pool): string {
     return NonfungiblePositionManager.INTERFACE.encodeFunctionData('createAndInitializePoolIfNecessary', [
@@ -197,10 +218,10 @@ export abstract class NonfungiblePositionManager extends SelfPermit {
 
     // permits if necessary
     if (options.token0Permit) {
-      calldatas.push(NonfungiblePositionManager.encodePermit(position.pool.token0, options.token0Permit))
+      calldatas.push(SelfPermit.encodePermit(position.pool.token0, options.token0Permit))
     }
     if (options.token1Permit) {
-      calldatas.push(NonfungiblePositionManager.encodePermit(position.pool.token1, options.token1Permit))
+      calldatas.push(SelfPermit.encodePermit(position.pool.token1, options.token1Permit))
     }
 
     // mint
@@ -250,17 +271,14 @@ export abstract class NonfungiblePositionManager extends SelfPermit {
 
       // we only need to refund if we're actually sending ETH
       if (JSBI.greaterThan(wrappedValue, ZERO)) {
-        calldatas.push(NonfungiblePositionManager.INTERFACE.encodeFunctionData('refundETH'))
+        calldatas.push(Payments.encodeRefundETH())
       }
 
       value = toHex(wrappedValue)
     }
 
     return {
-      calldata:
-        calldatas.length === 1
-          ? calldatas[0]
-          : NonfungiblePositionManager.INTERFACE.encodeFunctionData('multicall', [calldatas]),
+      calldata: Multicall.encodeMulticall(calldatas),
       value
     }
   }
@@ -298,16 +316,8 @@ export abstract class NonfungiblePositionManager extends SelfPermit {
         ? options.expectedCurrencyOwed1.quotient
         : options.expectedCurrencyOwed0.quotient
 
-      calldatas.push(
-        NonfungiblePositionManager.INTERFACE.encodeFunctionData('unwrapWETH9', [toHex(ethAmount), recipient])
-      )
-      calldatas.push(
-        NonfungiblePositionManager.INTERFACE.encodeFunctionData('sweepToken', [
-          token.address,
-          toHex(tokenAmount),
-          recipient
-        ])
-      )
+      calldatas.push(Payments.encodeUnwrapWETH9(ethAmount, recipient))
+      calldatas.push(Payments.encodeSweepToken(token, tokenAmount, recipient))
     }
 
     return calldatas
@@ -317,10 +327,7 @@ export abstract class NonfungiblePositionManager extends SelfPermit {
     const calldatas: string[] = NonfungiblePositionManager.encodeCollect(options)
 
     return {
-      calldata:
-        calldatas.length === 1
-          ? calldatas[0]
-          : NonfungiblePositionManager.INTERFACE.encodeFunctionData('multicall', [calldatas]),
+      calldata: Multicall.encodeMulticall(calldatas),
       value: toHex(0)
     }
   }
@@ -380,7 +387,7 @@ export abstract class NonfungiblePositionManager extends SelfPermit {
     const { expectedCurrencyOwed0, expectedCurrencyOwed1, ...rest } = options.collectOptions
     calldatas.push(
       ...NonfungiblePositionManager.encodeCollect({
-        tokenId: options.tokenId,
+        tokenId: toHex(options.tokenId),
         // add the underlying value to the expected currency already owed
         expectedCurrencyOwed0: expectedCurrencyOwed0.add(
           CurrencyAmount.fromRawAmount(expectedCurrencyOwed0.currency, amount0Min)
@@ -401,7 +408,30 @@ export abstract class NonfungiblePositionManager extends SelfPermit {
     }
 
     return {
-      calldata: NonfungiblePositionManager.INTERFACE.encodeFunctionData('multicall', [calldatas]),
+      calldata: Multicall.encodeMulticall(calldatas),
+      value: toHex(0)
+    }
+  }
+
+  public static safeTransferFromParameters(options: SafeTransferOptions): MethodParameters {
+    const recipient = validateAndParseAddress(options.recipient)
+    const sender = validateAndParseAddress(options.sender)
+
+    let calldata: string
+    if (options.data) {
+      calldata = NonfungiblePositionManager.INTERFACE.encodeFunctionData(
+        'safeTransferFrom(address,address,uint256,bytes)',
+        [sender, recipient, toHex(options.tokenId), options.data]
+      )
+    } else {
+      calldata = NonfungiblePositionManager.INTERFACE.encodeFunctionData('safeTransferFrom(address,address,uint256)', [
+        sender,
+        recipient,
+        toHex(options.tokenId)
+      ])
+    }
+    return {
+      calldata: calldata,
       value: toHex(0)
     }
   }
