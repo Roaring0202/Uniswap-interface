@@ -6,9 +6,7 @@ import { ADDRESS_ZERO } from './constants'
 import { PermitOptions, SelfPermit } from './selfPermit'
 import { encodeRouteToPath } from './utils'
 import { MethodParameters, toHex } from './utils/calldata'
-import ISwapRouter from '@uniswap/v3-periphery/artifacts/contracts/SwapRouter.sol/SwapRouter.json'
-import { Multicall } from './multicall'
-import { FeeOptions, Payments } from './payments'
+
 
 /**
  * Options for producing the arguments to send calls to the router.
@@ -62,26 +60,15 @@ export abstract class SwapRouter {
    * @param options options for the call parameters
    */
   public static swapCallParameters(
-    trades: Trade<Currency, Currency, TradeType> | Trade<Currency, Currency, TradeType>[],
+    trade: Trade<Currency, Currency, TradeType> | AggregatedTrade<Currency, Currency, TradeType>,
     options: SwapOptions
   ): MethodParameters {
-    if (!Array.isArray(trades)) {
-      trades = [trades]
+    const isAggregated = (
+      trade: Trade<Currency, Currency, TradeType> | AggregatedTrade<Currency, Currency, TradeType>
+    ): trade is AggregatedTrade<Currency, Currency, TradeType> => {
+      return (trade as AggregatedTrade<Currency, Currency, TradeType>).trades !== undefined
     }
 
-    const sampleTrade = trades[0]
-    const tokenIn = sampleTrade.inputAmount.currency.wrapped
-    const tokenOut = sampleTrade.outputAmount.currency.wrapped
-
-    // All trades should have the same starting and ending token.
-    invariant(
-      trades.every(trade => trade.inputAmount.currency.wrapped.equals(tokenIn)),
-      'TOKEN_IN_DIFF'
-    )
-    invariant(
-      trades.every(trade => trade.outputAmount.currency.wrapped.equals(tokenOut)),
-      'TOKEN_OUT_DIFF'
-    )
 
     const calldatas: string[] = []
 
@@ -89,7 +76,7 @@ export abstract class SwapRouter {
     const ZERO_OUT: CurrencyAmount<Currency> = CurrencyAmount.fromRawAmount(trades[0].outputAmount.currency, 0)
 
     const totalAmountOut: CurrencyAmount<Currency> = trades.reduce(
-      (sum, trade) => sum.add(trade.minimumAmountOut(options.slippageTolerance)),
+      (sum, trades) => sum.add(trades.minimumAmountOut(options.slippageTolerance)),
       ZERO_OUT
     )
 
@@ -101,7 +88,7 @@ export abstract class SwapRouter {
     const routerMustCustody = outputIsNative || !!options.fee
 
     const totalValue: CurrencyAmount<Currency> = inputIsNative
-      ? trades.reduce((sum, trade) => sum.add(trade.maximumAmountIn(options.slippageTolerance)), ZERO_IN)
+      ? trades.reduce((sum, trades) => sum.add(trades.maximumAmountIn(options.slippageTolerance)), ZERO_IN)
       : ZERO_IN
 
     // encode permit if necessary
@@ -114,40 +101,7 @@ export abstract class SwapRouter {
     const deadline = toHex(options.deadline)
 
     for (const trade of trades) {
-      for (const { route, inputAmount, outputAmount } of trade.swaps) {
-        const amountIn: string = toHex(trade.maximumAmountIn(options.slippageTolerance, inputAmount).quotient)
-        const amountOut: string = toHex(trade.minimumAmountOut(options.slippageTolerance, outputAmount).quotient)
 
-        // flag for whether the trade is single hop or not
-        const singleHop = route.pools.length === 1
-
-        if (singleHop) {
-          if (trade.tradeType === TradeType.EXACT_INPUT) {
-            const exactInputSingleParams = {
-              tokenIn: route.tokenPath[0].address,
-              tokenOut: route.tokenPath[1].address,
-              fee: route.pools[0].fee,
-              recipient: routerMustCustody ? ADDRESS_ZERO : recipient,
-              deadline,
-              amountIn,
-              amountOutMinimum: amountOut,
-              sqrtPriceLimitX96: toHex(options.sqrtPriceLimitX96 ?? 0)
-            }
-
-            calldatas.push(SwapRouter.INTERFACE.encodeFunctionData('exactInputSingle', [exactInputSingleParams]))
-          } else {
-            const exactOutputSingleParams = {
-              tokenIn: route.tokenPath[0].address,
-              tokenOut: route.tokenPath[1].address,
-              fee: route.pools[0].fee,
-              recipient: routerMustCustody ? ADDRESS_ZERO : recipient,
-              deadline,
-              amountOut,
-              amountInMaximum: amountIn,
-              sqrtPriceLimitX96: toHex(options.sqrtPriceLimitX96 ?? 0)
-            }
-
-            calldatas.push(SwapRouter.INTERFACE.encodeFunctionData('exactOutputSingle', [exactOutputSingleParams]))
           }
         } else {
           invariant(options.sqrtPriceLimitX96 === undefined, 'MULTIHOP_PRICE_LIMIT')
