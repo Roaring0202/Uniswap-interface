@@ -1,43 +1,43 @@
 import invariant from 'tiny-invariant'
 
-import { ChainId, Currency, ETHER, Price, Token, WETH9 } from '@uniswap/sdk-core'
+import { Currency, Price, Token } from '@uniswap/sdk-core'
 import { Pool } from './pool'
 
 /**
  * Represents a list of pools through which a swap can occur
+ * @template TInput The input token
+ * @template TOutput The output token
  */
-export class Route {
+export class Route<TInput extends Currency, TOutput extends Currency> {
   public readonly pools: Pool[]
   public readonly tokenPath: Token[]
-  public readonly input: Currency
-  public readonly output: Currency
+  public readonly input: TInput
+  public readonly output: TOutput
 
-  private _midPrice: Price | null = null
+  private _midPrice: Price<TInput, TOutput> | null = null
 
-  public constructor(pools: Pool[], input: Currency, output?: Currency) {
+  /**
+   * Creates an instance of route.
+   * @param pools An array of `Pool` objects, ordered by the route the swap will take
+   * @param input The input token
+   * @param output The output token
+   */
+  public constructor(pools: Pool[], input: TInput, output: TOutput) {
     invariant(pools.length > 0, 'POOLS')
 
     const chainId = pools[0].chainId
     const allOnSameChain = pools.every(pool => pool.chainId === chainId)
     invariant(allOnSameChain, 'CHAIN_IDS')
 
-    const weth: Token | undefined = WETH9[chainId as ChainId]
+    const wrappedInput = input.wrapped
+    invariant(pools[0].involvesToken(wrappedInput), 'INPUT')
 
-    const inputTokenIsInFirstPool = input instanceof Token && pools[0].involvesToken(input)
-    const inputWethIsInFirstPool = input === ETHER && weth && pools[0].involvesToken(weth)
-    const inputIsValid = inputTokenIsInFirstPool || inputWethIsInFirstPool
-    invariant(inputIsValid, 'INPUT')
-
-    const noOutput = typeof output === 'undefined'
-    const outputTokenIsInLastPool = output instanceof Token && pools[pools.length - 1].involvesToken(output)
-    const outputWethIsInLastPool = output === ETHER && weth && pools[pools.length - 1].involvesToken(weth)
-    const outputIsValid = noOutput || outputTokenIsInLastPool || outputWethIsInLastPool
-    invariant(outputIsValid, 'OUTPUT')
+    invariant(pools[pools.length - 1].involvesToken(output.wrapped), 'OUTPUT')
 
     /**
      * Normalizes token0-token1 order and selects the next token/fee step to add to the path
      * */
-    const tokenPath: Token[] = [input instanceof Token ? input : weth]
+    const tokenPath: Token[] = [wrappedInput]
     for (const [i, pool] of pools.entries()) {
       const currentInputToken = tokenPath[i]
       invariant(currentInputToken.equals(pool.token0) || currentInputToken.equals(pool.token1), 'PATH')
@@ -51,32 +51,14 @@ export class Route {
     this.output = output ?? tokenPath[tokenPath.length - 1]
   }
 
-  public get chainId(): ChainId | number {
+  public get chainId(): number {
     return this.pools[0].chainId
-  }
-
-  /**
-   * Returns the token representation of the input currency. If the input currency is Ether, returns the wrapped ether token.
-   */
-  public get inputToken(): Token {
-    if (this.input instanceof Token) return this.input
-    invariant(this.input === Currency.ETHER, 'ETHER')
-    return WETH9[this.chainId as ChainId]
-  }
-
-  /**
-   * Returns the token representation of the output currency. If the output currency is Ether, returns the wrapped ether token.
-   */
-  public get outputToken(): Token {
-    if (this.output instanceof Token) return this.output
-    invariant(this.output === Currency.ETHER, 'ETHER')
-    return WETH9[this.chainId as ChainId]
   }
 
   /**
    * Returns the mid price of the route
    */
-  public get midPrice(): Price {
+  public get midPrice(): Price<TInput, TOutput> {
     if (this._midPrice !== null) return this._midPrice
 
     const price = this.pools.slice(1).reduce(
@@ -91,7 +73,7 @@ export class Route {
               price: price.multiply(pool.token1Price)
             }
       },
-      this.pools[0].token0.equals(this.inputToken)
+      this.pools[0].token0.equals(this.input.wrapped)
         ? {
             nextInput: this.pools[0].token1,
             price: this.pools[0].token0Price

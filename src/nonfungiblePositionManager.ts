@@ -1,14 +1,11 @@
 import {
   BigintIsh,
-  ChainId,
-  CurrencyAmount,
-  currencyEquals,
-  ETHER,
   Percent,
   Token,
-  TokenAmount,
+  CurrencyAmount,
   validateAndParseAddress,
-  WETH9
+  Currency,
+  NativeCurrency
 } from '@uniswap/sdk-core'
 import JSBI from 'jsbi'
 import invariant from 'tiny-invariant'
@@ -16,9 +13,12 @@ import { Position } from './entities/position'
 import { ONE, ZERO } from './internalConstants'
 import { MethodParameters, toHex } from './utils/calldata'
 import { Interface } from '@ethersproject/abi'
-import { abi } from '@uniswap/v3-periphery/artifacts/contracts/NonfungiblePositionManager.sol/NonfungiblePositionManager.json'
+import INonfungiblePositionManager from '@uniswap/v3-periphery/artifacts/contracts/NonfungiblePositionManager.sol/NonfungiblePositionManager.json'
 import { PermitOptions, SelfPermit } from './selfPermit'
 import { ADDRESS_ZERO } from './constants'
+import { Pool } from './entities'
+import { Multicall } from './multicall'
+import { Payments } from './payments'
 
 const MaxUint128 = toHex(JSBI.subtract(JSBI.exponentiate(JSBI.BigInt(2), JSBI.BigInt(128)), JSBI.BigInt(1)))
 
@@ -58,7 +58,7 @@ export interface CommonAddLiquidityOptions {
   /**
    * Whether to spend ether. If true, one of the pool tokens must be WETH, by default false
    */
-  useEther?: boolean
+  useNative?: NativeCurrency
 
   /**
    * The optional permit parameters for spending token0
@@ -76,6 +76,27 @@ export type IncreaseOptions = CommonAddLiquidityOptions & IncreaseSpecificOption
 
 export type AddLiquidityOptions = MintOptions | IncreaseOptions
 
+export interface SafeTransferOptions {
+  /**
+   * The account sending the NFT.
+   */
+  sender: string
+
+  /**
+   * The account that should receive the NFT.
+   */
+  recipient: string
+
+  /**
+   * The id of the token being sent.
+   */
+  tokenId: BigintIsh
+  /**
+   * The optional parameter that passes data to the `onERC721Received` call for the staker
+   */
+  data?: string
+}
+
 // type guard
 function isMint(options: AddLiquidityOptions): options is MintOptions {
   return Object.keys(options).some(k => k === 'recipient')
@@ -90,12 +111,12 @@ export interface CollectOptions {
   /**
    * Expected value of tokensOwed0, including as-of-yet-unaccounted-for fees/liquidity value to be burned
    */
-  expectedCurrencyOwed0: CurrencyAmount
+  expectedCurrencyOwed0: CurrencyAmount<Currency>
 
   /**
    * Expected value of tokensOwed1, including as-of-yet-unaccounted-for fees/liquidity value to be burned
    */
-  expectedCurrencyOwed1: CurrencyAmount
+  expectedCurrencyOwed1: CurrencyAmount<Currency>
 
   /**
    * The account that should receive the tokens.
@@ -151,14 +172,28 @@ export interface RemoveLiquidityOptions {
   collectOptions: Omit<CollectOptions, 'tokenId'>
 }
 
-export abstract class NonfungiblePositionManager extends SelfPermit {
-  public static INTERFACE: Interface = new Interface(abi)
+export abstract class NonfungiblePositionManager {
+  public static INTERFACE: Interface = new Interface(INonfungiblePositionManager.abi)
 
   /**
    * Cannot be constructed.
    */
-  private constructor() {
-    super()
+  private constructor() {}
+
+  private static encodeCreate(pool: Pool): string {
+    return NonfungiblePositionManager.INTERFACE.encodeFunctionData('createAndInitializePoolIfNecessary', [
+      pool.token0.address,
+      pool.token1.address,
+      pool.fee,
+      toHex(pool.sqrtRatioX96)
+    ])
+  }
+
+  public static createCallParameters(pool: Pool): MethodParameters {
+    return {
+      calldata: this.encodeCreate(pool),
+      value: toHex(0)
+    }
   }
 
   public static addCallParameters(position: Position, options: AddLiquidityOptions): MethodParameters {
@@ -178,22 +213,15 @@ export abstract class NonfungiblePositionManager extends SelfPermit {
 
     // create pool if needed
     if (isMint(options) && options.createPool) {
-      calldatas.push(
-        NonfungiblePositionManager.INTERFACE.encodeFunctionData('createAndInitializePoolIfNecessary', [
-          position.pool.token0.address,
-          position.pool.token1.address,
-          position.pool.fee,
-          toHex(position.pool.sqrtRatioX96)
-        ])
-      )
+      calldatas.push(this.encodeCreate(position.pool))
     }
 
     // permits if necessary
     if (options.token0Permit) {
-      calldatas.push(NonfungiblePositionManager.encodePermit(position.pool.token0, options.token0Permit))
+      calldatas.push(SelfPermit.encodePermit(position.pool.token0, options.token0Permit))
     }
     if (options.token1Permit) {
-      calldatas.push(NonfungiblePositionManager.encodePermit(position.pool.token1, options.token1Permit))
+      calldatas.push(SelfPermit.encodePermit(position.pool.token1, options.token1Permit))
     }
 
     // mint
@@ -235,25 +263,22 @@ export abstract class NonfungiblePositionManager extends SelfPermit {
 
     let value: string = toHex(0)
 
-    if (options.useEther) {
-      const weth = WETH9[position.pool.chainId as ChainId]
-      invariant(weth && (position.pool.token0.equals(weth) || position.pool.token1.equals(weth)), 'NO_WETH')
+    if (options.useNative) {
+      const wrapped = options.useNative.wrapped
+      invariant(position.pool.token0.equals(wrapped) || position.pool.token1.equals(wrapped), 'NO_WETH')
 
-      const wethValue = position.pool.token0.equals(weth) ? amount0Desired : amount1Desired
+      const wrappedValue = position.pool.token0.equals(wrapped) ? amount0Desired : amount1Desired
 
       // we only need to refund if we're actually sending ETH
-      if (JSBI.greaterThan(wethValue, ZERO)) {
-        calldatas.push(NonfungiblePositionManager.INTERFACE.encodeFunctionData('refundETH'))
+      if (JSBI.greaterThan(wrappedValue, ZERO)) {
+        calldatas.push(Payments.encodeRefundETH())
       }
 
-      value = toHex(wethValue)
+      value = toHex(wrappedValue)
     }
 
     return {
-      calldata:
-        calldatas.length === 1
-          ? calldatas[0]
-          : NonfungiblePositionManager.INTERFACE.encodeFunctionData('multicall', [calldatas]),
+      calldata: Multicall.encodeMulticall(calldatas),
       value
     }
   }
@@ -264,8 +289,7 @@ export abstract class NonfungiblePositionManager extends SelfPermit {
     const tokenId = toHex(options.tokenId)
 
     const involvesETH =
-      currencyEquals(options.expectedCurrencyOwed0.currency, ETHER) ||
-      currencyEquals(options.expectedCurrencyOwed1.currency, ETHER)
+      options.expectedCurrencyOwed0.currency.isNative || options.expectedCurrencyOwed1.currency.isNative
 
     const recipient = validateAndParseAddress(options.recipient)
 
@@ -282,26 +306,18 @@ export abstract class NonfungiblePositionManager extends SelfPermit {
     )
 
     if (involvesETH) {
-      const ethAmount = currencyEquals(options.expectedCurrencyOwed0.currency, ETHER)
-        ? options.expectedCurrencyOwed0.raw
-        : options.expectedCurrencyOwed1.raw
-      const token = currencyEquals(options.expectedCurrencyOwed0.currency, ETHER)
+      const ethAmount = options.expectedCurrencyOwed0.currency.isNative
+        ? options.expectedCurrencyOwed0.quotient
+        : options.expectedCurrencyOwed1.quotient
+      const token = options.expectedCurrencyOwed0.currency.isNative
         ? (options.expectedCurrencyOwed1.currency as Token)
         : (options.expectedCurrencyOwed0.currency as Token)
-      const tokenAmount = currencyEquals(options.expectedCurrencyOwed0.currency, ETHER)
-        ? options.expectedCurrencyOwed1.raw
-        : options.expectedCurrencyOwed0.raw
+      const tokenAmount = options.expectedCurrencyOwed0.currency.isNative
+        ? options.expectedCurrencyOwed1.quotient
+        : options.expectedCurrencyOwed0.quotient
 
-      calldatas.push(
-        NonfungiblePositionManager.INTERFACE.encodeFunctionData('unwrapWETH9', [toHex(ethAmount), recipient])
-      )
-      calldatas.push(
-        NonfungiblePositionManager.INTERFACE.encodeFunctionData('sweepToken', [
-          token.address,
-          toHex(tokenAmount),
-          recipient
-        ])
-      )
+      calldatas.push(Payments.encodeUnwrapWETH9(ethAmount, recipient))
+      calldatas.push(Payments.encodeSweepToken(token, tokenAmount, recipient))
     }
 
     return calldatas
@@ -311,18 +327,16 @@ export abstract class NonfungiblePositionManager extends SelfPermit {
     const calldatas: string[] = NonfungiblePositionManager.encodeCollect(options)
 
     return {
-      calldata:
-        calldatas.length === 1
-          ? calldatas[0]
-          : NonfungiblePositionManager.INTERFACE.encodeFunctionData('multicall', [calldatas]),
+      calldata: Multicall.encodeMulticall(calldatas),
       value: toHex(0)
     }
   }
 
   /**
    * Produces the calldata for completely or partially exiting a position
-   * @param position the position to exit
-   * @param options additional information necessary for generating the calldata
+   * @param position The position to exit
+   * @param options Additional information necessary for generating the calldata
+   * @returns The call parameters
    */
   public static removeCallParameters(position: Position, options: RemoveLiquidityOptions): MethodParameters {
     const calldatas: string[] = []
@@ -373,17 +387,13 @@ export abstract class NonfungiblePositionManager extends SelfPermit {
     const { expectedCurrencyOwed0, expectedCurrencyOwed1, ...rest } = options.collectOptions
     calldatas.push(
       ...NonfungiblePositionManager.encodeCollect({
-        tokenId: options.tokenId,
+        tokenId: toHex(options.tokenId),
         // add the underlying value to the expected currency already owed
         expectedCurrencyOwed0: expectedCurrencyOwed0.add(
-          currencyEquals(expectedCurrencyOwed0.currency, ETHER)
-            ? CurrencyAmount.ether(amount0Min)
-            : new TokenAmount(expectedCurrencyOwed0.currency as Token, amount0Min)
+          CurrencyAmount.fromRawAmount(expectedCurrencyOwed0.currency, amount0Min)
         ),
         expectedCurrencyOwed1: expectedCurrencyOwed1.add(
-          currencyEquals(expectedCurrencyOwed1.currency, ETHER)
-            ? CurrencyAmount.ether(amount1Min)
-            : new TokenAmount(expectedCurrencyOwed1.currency as Token, amount1Min)
+          CurrencyAmount.fromRawAmount(expectedCurrencyOwed1.currency, amount1Min)
         ),
         ...rest
       })
@@ -398,7 +408,30 @@ export abstract class NonfungiblePositionManager extends SelfPermit {
     }
 
     return {
-      calldata: NonfungiblePositionManager.INTERFACE.encodeFunctionData('multicall', [calldatas]),
+      calldata: Multicall.encodeMulticall(calldatas),
+      value: toHex(0)
+    }
+  }
+
+  public static safeTransferFromParameters(options: SafeTransferOptions): MethodParameters {
+    const recipient = validateAndParseAddress(options.recipient)
+    const sender = validateAndParseAddress(options.sender)
+
+    let calldata: string
+    if (options.data) {
+      calldata = NonfungiblePositionManager.INTERFACE.encodeFunctionData(
+        'safeTransferFrom(address,address,uint256,bytes)',
+        [sender, recipient, toHex(options.tokenId), options.data]
+      )
+    } else {
+      calldata = NonfungiblePositionManager.INTERFACE.encodeFunctionData('safeTransferFrom(address,address,uint256)', [
+        sender,
+        recipient,
+        toHex(options.tokenId)
+      ])
+    }
+    return {
+      calldata: calldata,
       value: toHex(0)
     }
   }
